@@ -1,0 +1,22 @@
+database     = "~/timelogbot.db"
+recipients   = [
+             "info@example.com",
+]
+
+[email]
+host         = "mail.example.com"
+port         = 587
+user         = "timelogbot@example.com"
+password     = "hunter2"
+sender       = "timelogbot@example.com"
+
+[timelog]
+url          = "https://xyz.timelog.example.com/myorganization/service.asmx?wsdl"
+site_code    = ""
+api_id       = "api-id-user"
+api_password = "my-api-password"
+
+[confluence]
+url          = "https://myconfluence.example.com/rest/api"
+user         = "timelog-bot@example.com"
+api_token    = "wNvQsqj7q7bS_FAKE_KEY_zjHSEejf97znC"
