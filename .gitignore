@@ -1,3 +1,5 @@
 config.ini
+*.yaml
+*.yml
 *~
 *.sw*
