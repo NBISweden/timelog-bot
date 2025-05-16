@@ -1,5 +1,8 @@
-config.ini
+config.*
 *.yaml
 *.yml
+*.ini
+*.toml
 *~
 *.sw*
+venv/
