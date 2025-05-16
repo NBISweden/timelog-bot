@@ -355,9 +355,9 @@ def main():
                 #pdb.set_trace()
                 project_id = [attr['value'] for attr in project['_decoded_attrs']['custom_fields'] if attr['name'] == 'WABI ID'][0]
             except (IndexError, KeyError):
-                project_id = None
+                project_id = ''
 
-            if project_id is None:
+            if project_id == '' or project_id is None:
 
                 # try using the subject name, if it follows the project id pattern (should this be removed after development?)
                 if re.match(r'.*_\d{4}$', project['_decoded_attrs']['subject']):
@@ -370,9 +370,12 @@ def main():
                     print("(redmine id {}) {:>25s}: ignored, no WABI ID attribute or compatible issue subject found.".format(project['_decoded_attrs']['id'], project['_decoded_attrs']['subject']))
                     continue
 
+            #pdb.set_trace()
             # save the project id with special characters removed
             projects[normalize_project_id(project_id)] = project
 
+    #pdb.set_trace()
+    #sys.exit()
 
     # connect to confluence
     confluence = Confluence(
