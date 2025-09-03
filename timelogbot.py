@@ -309,6 +309,7 @@ def main():
     parser.add_argument(
         "--space", default=None, help="Confluence space to work on (default: all)"
     )
+    parser.add_argument("--issue", "-i", default=None, help="Redmine issue to work on (debugging only)")
     parser.add_argument(
         "--dry-run",
         "-n",
@@ -345,10 +346,15 @@ def main():
 
     # get the issues related to desired redmine projects
     projects = {}
+    print("Skipping all Redmine issues except for issue id {}".format(args.issue)) if args.issue is not None else None
     for redmine_project_id in config.redmine['projects']:
 
         # structure the data
         for project in redmine.issue.filter(project_id=redmine_project_id, status_id='*'):
+
+            # if a specific issue has been requested, skip all others
+            if args.issue is not None and str(project.id) != str(args.issue):
+                continue
 
             # get project id
             try:
@@ -403,6 +409,7 @@ def main():
 
         # find the corresponding redmine project if possible
         elif space_name_norm in projects or space_name_norm.replace("NBIS ", "") in projects:
+
             try:
                 project = projects[space_name_norm]
             except KeyError:
