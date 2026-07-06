@@ -1,4 +1,3 @@
-config.*
 *.yaml
 *.yml
 *.ini
@@ -6,3 +5,5 @@ config.*
 *~
 *.sw*
 venv/
+*.json
+__*
