@@ -62,6 +62,7 @@ def setup_argparse():
     parser.add_argument('--dry-run', '-n', action='store_true', help='Run the script without making any changes')
     parser.add_argument('--force-update', '-f', action='store_true', help='Force processing even if hours have not changed')
     parser.add_argument('--force-save-state', '-s', action='store_true', help='Force saving of the state, even if dry-run or debug options are used')
+    parser.add_argument('--state-file', type=str, help='Path to state file (default: state.yaml in script directory)')
     return parser.parse_args()
 
 
@@ -382,8 +383,11 @@ def main():
     logger.debug("Loading configuration")
     config = load_config(args.config)
 
-    script_dir = os.path.dirname(os.path.realpath(__file__))
-    state_file_path = os.path.join(script_dir, 'state.yaml')
+    if args.state_file:
+        state_file_path = args.state_file
+    else:
+        script_dir = os.path.dirname(os.path.realpath(__file__))
+        state_file_path = os.path.join(script_dir, 'state.yaml')
 
     logger.debug("Loading state")
     state = load_state(state_file_path)
