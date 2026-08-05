@@ -2,10 +2,12 @@ redmine:
   api_key: your-redmine-api-key
   base_url: https://redmine.example.com
 
+
 confluence:
   username: timelog-bot@example.com
   api_key: your-confluence-api-token
   base_url: https://myconfluence.example.com/
+
 
 smtp:
   server: mail.example.com
@@ -13,8 +15,11 @@ smtp:
   from: timelogbot@example.com
   password: hunter2
 
+
 project_groups:
-  - ids:
+
+  - group_name: "My Redmine project"
+    ids:
       - my-redmine-project
     managers:
       - info@example.com
@@ -23,7 +28,9 @@ project_groups:
     checkpoints:
       days: [15, 180, 365]       # Days passed checkpoints
       percent_hours: [50, 90, 100]  # Hours logged checkpoints
-  - ids:
+
+  - group_name: "Another Redmine project"
+    ids:
       - another-redmine-project
     managers:
       - info@example.com
