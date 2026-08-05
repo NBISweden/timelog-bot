@@ -48,6 +48,20 @@ def load_state(file_path):
     return {}
 
 
+def should_save_state(args):
+    """
+    Decide whether state changes should be persisted to disk, given the current run's flags.
+    Dry runs and debug-scoped runs must not corrupt the real state file unless explicitly forced.
+    :param args: Command line arguments
+    :return: True if state should be saved
+    """
+    if args.no_save_state:
+        return False
+    if args.force_save_state:
+        return True
+    return not (args.dry_run or args.debug_issue_id or args.debug_space)
+
+
 def setup_argparse():
     """
     Set up command line argument parsing.
@@ -57,11 +71,13 @@ def setup_argparse():
     parser.add_argument('--config', '-c', type=str, required=True, help='Path to the config file')
     parser.add_argument('--debug', '-d', action='store_true', help='Enable debug messages')
     parser.add_argument('--debug-issue-id', type=int, help='Limit updating to a specific Redmine ticket for debugging, e.g. 1234')
-    parser.add_argument('--debug-space', type=str, help='Limit updating to a specific Confluence space for debugging')
+    parser.add_argument('--debug-space', type=str, help='Limit updating to a specific Confluence space (name, not space key) for debugging')
     parser.add_argument('--disable-email', '-e', action='store_true', help='Emailing disabled')
     parser.add_argument('--dry-run', '-n', action='store_true', help='Run the script without making any changes')
     parser.add_argument('--force-update', '-f', action='store_true', help='Force processing even if hours have not changed')
-    parser.add_argument('--force-save-state', '-s', action='store_true', help='Force saving of the state, even if dry-run or debug options are used')
+    save_state_group = parser.add_mutually_exclusive_group()
+    save_state_group.add_argument('--force-save-state', '-s', action='store_true', help='Force saving of the state, even if dry-run or debug options are used')
+    save_state_group.add_argument('--no-save-state', action='store_true', help='Never save state, even on a normal run (useful when developing, to keep re-triggering the same events on rerun)')
     parser.add_argument('--state-file', type=str, help='Path to state file (default: state.yaml in script directory)')
     return parser.parse_args()
 
@@ -141,6 +157,27 @@ def fetch_issues(config, project_id):
     return issues
 
 
+def build_report_header(support_project_id, total_hours, hours_ordered):
+    """
+    Build the "Project X is Y% complete" header shown on a TimeLog page.
+    Falls back to a plain hours-spent line when no budget ("Hours ordered") is set,
+    since a percentage against an unknown budget would be meaningless.
+    :param support_project_id: WABI ID of the project
+    :param total_hours: Total hours logged on the issue
+    :param hours_ordered: Budgeted hours for the issue, or None if not set
+    :return: HTML string for the report header
+    """
+    if hours_ordered:
+        return (
+            f"<h2>Project {support_project_id} is {round(total_hours / hours_ordered * 100, 2)}% complete</h2>"
+            f"<p>{round(total_hours, 2)} out of {int(hours_ordered)} hours spent.</p>"
+        )
+    return (
+        f"<h2>Project {support_project_id}</h2>"
+        f"<p>{round(total_hours, 2)} hours spent.</p>"
+    )
+
+
 def update_confluence(args, config, issue, name2key, total_hours, time_entries):
     """
     Update the Confluence TimeLog page for a given issue with the latest hour totals.
@@ -160,7 +197,11 @@ def update_confluence(args, config, issue, name2key, total_hours, time_entries):
 
     # read WABI ID and hours ordered from Redmine custom fields
     support_project_id = next((cf['value'] for cf in issue['custom_fields'] if cf['name'] == 'WABI ID'), '')
-    hours_ordered = float(next((cf['value'] for cf in issue['custom_fields'] if cf['name'] == 'Hours ordered' and cf['value']), -1))
+    hours_ordered_raw = next((cf['value'] for cf in issue['custom_fields'] if cf['name'] == 'Hours ordered' and cf['value']), None)
+    hours_ordered = float(hours_ordered_raw) if hours_ordered_raw else None
+
+    if support_project_id and not support_project_id.isascii():
+        logger.warning(f"WABI ID \"{support_project_id}\" contains non-ASCII characters; Confluence space name matching may fail.")
 
     # allow overriding the target space when debugging
     if args.debug_space:
@@ -170,11 +211,14 @@ def update_confluence(args, config, issue, name2key, total_hours, time_entries):
         space_name = f"NBIS {support_project_id}"
 
     # resolve space name to its Confluence key
-    try:
-        space_key = name2key.get(space_name)[0]['key']
-    except (TypeError, IndexError):
+    matches = name2key.get(space_name)
+    if not matches:
         logger.error(f"Space \"{space_name}\" not found in Confluence, skipping update for WABI ID \"{support_project_id}\".")
         return False
+    if len(matches) > 1:
+        logger.error(f"Space \"{space_name}\" is ambiguous ({len(matches)} matches) in Confluence, skipping update for WABI ID \"{support_project_id}\".")
+        return False
+    space_key = matches[0]['key']
 
     page_title = "TimeLog"
 
@@ -215,8 +259,7 @@ def update_confluence(args, config, issue, name2key, total_hours, time_entries):
         new_body = (
             f"{head}"
             f"<hr />"
-            f"<h2>Project {support_project_id} is {round(total_hours / hours_ordered * 100, 2)}% complete</h2>"
-            f"<p>{round(total_hours, 2)} out of {int(hours_ordered)} hours spent.</p>"
+            f"{build_report_header(support_project_id, total_hours, hours_ordered)}"
             f"<p><table><tr><th>Date</th><th>Hours spent</th></tr>"
             f"{table_rows}"
             f"</table></p>"
@@ -244,8 +287,7 @@ def update_confluence(args, config, issue, name2key, total_hours, time_entries):
         # page does not exist — create it with no pre-existing user header
         new_body = (
             f"<hr />"
-            f"<h2>Project {support_project_id} is {round(total_hours / hours_ordered * 100, 2)}% complete</h2>"
-            f"<p>{total_hours} out of {hours_ordered} used.</p>"
+            f"{build_report_header(support_project_id, total_hours, hours_ordered)}"
             f"<p><table><tr><th>Date</th><th>Hours spent</th></tr>"
             f"{table_rows}"
             f"</table></p>"
@@ -295,6 +337,36 @@ def summarize_time_entries_by_month(time_entries):
         })
 
     return result
+
+
+def issue_url(config, issue):
+    """
+    Build a link to a Redmine issue's page.
+    :param config: Configuration dictionary
+    :param issue: Redmine issue dictionary
+    :return: URL string
+    """
+    return f"{config['redmine']['base_url']}/issues/{issue['id']}"
+
+
+def build_notification_body(config, issue, headline, total_hours, hours_ordered=None):
+    """
+    Build the plain-text body for a checkpoint notification e-mail.
+    :param config: Configuration dictionary
+    :param issue: Redmine issue dictionary
+    :param headline: One-line description of the checkpoint that was crossed
+    :param total_hours: Total hours logged on the issue
+    :param hours_ordered: Budgeted hours for the issue, or None if not set
+    :return: Plain-text e-mail body
+    """
+    lines = [
+        f"Issue #{issue['id']}: {issue['subject']}",
+        headline,
+        "",
+        f"Total hours logged: {total_hours:.2f}" + (f" of {hours_ordered:.0f} ordered" if hours_ordered else ""),
+        f"Link: {issue_url(config, issue)}",
+    ]
+    return "\n".join(lines)
 
 
 def send_email(config, args, to_emails, subject, body):
@@ -422,104 +494,112 @@ def main():
 
                 logger.debug(f"Processing issue ID: {issue['id']}")
 
-                time_entries = fetch_time_entries(config, issue['id'])
-                total_hours = sum(entry['hours'] for entry in time_entries)
+                try:
+                    time_entries = fetch_time_entries(config, issue['id'])
+                    total_hours = sum(entry['hours'] for entry in time_entries)
 
-                # ensure issue ID is stored as a string for consistent state dict keys
-                issue['id'] = str(issue['id'])
-                logger.debug(f"Total hours for issue {issue['id']}: {total_hours}")
+                    # ensure issue ID is stored as a string for consistent state dict keys
+                    issue['id'] = str(issue['id'])
+                    logger.debug(f"Total hours for issue {issue['id']}: {total_hours}")
 
-                # calculate how many days the issue has been open
-                start_date = datetime.fromisoformat(issue['start_date'].replace('Z', '+00:00')).date()
-                current_date = datetime.now().date()
-                issue_age_days = (current_date - start_date).days
+                    # calculate how many days the issue has been open
+                    start_date = datetime.fromisoformat(issue['start_date'].replace('Z', '+00:00')).date()
+                    current_date = datetime.now().date()
+                    issue_age_days = (current_date - start_date).days
 
-                hours_ordered = next((float(cf['value']) for cf in issue['custom_fields'] if cf['name'] == 'Hours ordered' and cf['value']), '')
-                hours_percent = (total_hours / float(hours_ordered)) * 100 if hours_ordered else 0
+                    hours_ordered = next((float(cf['value']) for cf in issue['custom_fields'] if cf['name'] == 'Hours ordered' and cf['value']), '')
+                    hours_percent = (total_hours / float(hours_ordered)) * 100 if hours_ordered else 0
 
-                # first run for this issue: record baseline state and skip all notifications
-                # to avoid a flood of alerts for issues that have already been running for a while
-                if issue['id'] not in state:
-                    state[issue['id']] = {
-                        'total_hours': total_hours,
-                        'warnings_sent': {
-                            'hours_exceeded': total_hours >= hours_ordered if hours_ordered else False,
-                            'checkpoint_passed_days': [c for c in checkpoints['days'] if issue_age_days >= c],
-                            'checkpoint_passed_percent': [c for c in checkpoints['percent_hours'] if hours_percent >= c]
+                    # first run for this issue: record baseline state and skip all notifications
+                    # to avoid a flood of alerts for issues that have already been running for a while
+                    if issue['id'] not in state:
+                        state[issue['id']] = {
+                            'total_hours': total_hours,
+                            'warnings_sent': {
+                                'checkpoint_passed_days': [c for c in checkpoints['days'] if issue_age_days >= c],
+                                'checkpoint_passed_percent': [c for c in checkpoints['percent_hours'] if hours_percent >= c]
+                            }
                         }
-                    }
-                    logger.debug(f"Skipping issue {issue['id']} as it is new (first run).")
+                        logger.debug(f"Skipping issue {issue['id']} as it is new (first run).")
+                        continue
+
+                    # only update Confluence when hours have actually changed
+                    if state[issue['id']]['total_hours'] != total_hours or args.force_update:
+
+                        # update the Confluence page if this project group has that enabled
+                        support_project_id = next((cf['value'] for cf in issue['custom_fields'] if cf['name'] == 'WABI ID'), None)
+                        if support_project_id and update_pages:
+                            logger.debug(f"Updating Confluence page for project id {support_project_id}")
+                            update_confluence(args, config, issue, name2key, total_hours, time_entries)
+
+                    # check age checkpoints regardless of whether hours changed
+                    if start_date:
+                        newly_passed = [
+                            cp for cp in group['checkpoints']['days']
+                            if issue_age_days >= cp and cp not in state[issue['id']]['warnings_sent']['checkpoint_passed_days']
+                        ]
+                        if newly_passed:
+                            checkpoint_days = max(newly_passed)
+                            logger.warning(f"Issue {issue['id']} has passed {checkpoint_days} days since start date ({issue_age_days} days)")
+                            send_email(
+                                config, args, managers,
+                                f"TimeLogBot: {issue_age_days} days issue age for #{issue['id']}: \"{issue['subject']}\"",
+                                build_notification_body(
+                                    config, issue,
+                                    f"has been open for {issue_age_days} days (checkpoint: {checkpoint_days} days).",
+                                    total_hours, hours_ordered if hours_ordered else None
+                                )
+                            )
+                            state[issue['id']]['warnings_sent']['checkpoint_passed_days'].extend(newly_passed)
+                            state[issue['id']]['total_hours'] = total_hours
+                            if should_save_state(args):
+                                logger.debug("Saving state after e-mail notification")
+                                save_state(state, state_file_path)
+
+                    # check percentage-of-hours-used checkpoints
+                    if hours_ordered:
+                        newly_passed = [
+                            cp for cp in group['checkpoints']['percent_hours']
+                            if hours_percent >= cp and cp not in state[issue['id']]['warnings_sent']['checkpoint_passed_percent']
+                        ]
+                        if newly_passed:
+                            checkpoint_percent = max(newly_passed)
+                            logger.warning(f"Issue {issue['id']} has used {hours_percent:.1f}% of ordered hours (checkpoint: {checkpoint_percent}%)")
+                            send_email(
+                                config, args, managers,
+                                f"TimeLogBot: {hours_percent:.1f}% of ordered hours used by #{issue['id']}: \"{issue['subject']}\"",
+                                build_notification_body(
+                                    config, issue,
+                                    f"has used {hours_percent:.1f}% of ordered hours (checkpoint: {checkpoint_percent}%).",
+                                    total_hours, hours_ordered
+                                )
+                            )
+                            state[issue['id']]['warnings_sent']['checkpoint_passed_percent'].extend(newly_passed)
+                            state[issue['id']]['total_hours'] = total_hours
+                            if should_save_state(args):
+                                logger.debug("Saving state after e-mail notification")
+                                save_state(state, state_file_path)
+
+                    # when debugging a single ticket, stop here without persisting state changes
+                    if args.debug_issue_id:
+                        logger.debug(f"Stopping after processing debug ticket id {args.debug_issue_id}")
+                        break
+
+                    logger.debug("Saving issue state")
+                    state[issue['id']]['total_hours'] = total_hours
+                except Exception as e:
+                    logger.error(f"Failed to process issue {issue['id']}: {e}")
                     continue
-
-                # only update Confluence and check hour-based alerts when hours have actually changed
-                if state[issue['id']]['total_hours'] != total_hours or args.force_update:
-
-                    # update the Confluence page if this project group has that enabled
-                    support_project_id = next((cf['value'] for cf in issue['custom_fields'] if cf['name'] == 'WABI ID'), None)
-                    if support_project_id and update_pages:
-                        logger.debug(f"Updating Confluence page for project id {support_project_id}")
-                        update_confluence(args, config, issue, name2key, total_hours, time_entries)
-
-                    # send a warning if total hours have now exceeded the ordered amount (only once per issue)
-                    exceeded = hours_ordered and total_hours > float(hours_ordered)
-                    if exceeded and not state[issue['id']]['warnings_sent']['hours_exceeded']:
-                        logger.warning(f"Issue {issue['id']} has exceeded ordered hours: {total_hours} > {hours_ordered}")
-                        send_email(
-                            config, args, managers,
-                            f"TimeLogBot: Hours ordered exceeded for #{issue['id']}: \"{issue['subject']}\"",
-                            f"Issue {issue['id']} exceeded ordered hours."
-                        )
-
-                    # update the flag so we don't resend the alert if hours increase further
-                    state[issue['id']]['warnings_sent']['hours_exceeded'] = bool(exceeded)
-
-                # check age checkpoints regardless of whether hours changed
-                if start_date:
-                    newly_passed = [
-                        cp for cp in group['checkpoints']['days']
-                        if issue_age_days >= cp and cp not in state[issue['id']]['warnings_sent']['checkpoint_passed_days']
-                    ]
-                    if newly_passed:
-                        checkpoint_days = max(newly_passed)
-                        logger.warning(f"Issue {issue['id']} has passed {checkpoint_days} days since start date ({issue_age_days} days)")
-                        send_email(
-                            config, args, managers,
-                            f"TimeLogBot: {issue_age_days} days issue age for #{issue['id']}: \"{issue['subject']}\"",
-                            f"Issue {issue['id']} has been running for {issue_age_days} days (checkpoint: {checkpoint_days} days)."
-                        )
-                        state[issue['id']]['warnings_sent']['checkpoint_passed_days'].extend(newly_passed)
-
-                # check percentage-of-hours-used checkpoints
-                if hours_ordered:
-                    newly_passed = [
-                        cp for cp in group['checkpoints']['percent_hours']
-                        if hours_percent >= cp and cp not in state[issue['id']]['warnings_sent']['checkpoint_passed_percent'] 
-                    ]
-                    if newly_passed:
-                        checkpoint_percent = max(newly_passed)
-                        logger.warning(f"Issue {issue['id']} has used {hours_percent:.1f}% of ordered hours (checkpoint: {checkpoint_percent}%)")
-                        send_email(
-                            config, args, managers,
-                            f"TimeLogBot: {hours_percent:.1f}% of ordered hours used by #{issue['id']}: \"{issue['subject']}\"",
-                            f"Issue {issue['id']} has used {hours_percent:.1f}% of ordered hours (checkpoint: {checkpoint_percent}%)."
-                        )
-                        state[issue['id']]['warnings_sent']['checkpoint_passed_percent'].extend(newly_passed)
-
-                # when debugging a single ticket, stop here without persisting state changes
-                if args.debug_issue_id:
-                    logger.debug(f"Stopping after processing debug ticket id {args.debug_issue_id}")
-                    break
-
-                logger.debug("Saving issue state")
-                state[issue['id']]['total_hours'] = total_hours
     
-    if not args.force_save_state and args.dry_run:
-        logger.info("Dry run enabled, not saving state")
-    elif not args.force_save_state and (args.debug_issue_id or args.debug_space):
-        logger.info("Debug mode enabled, not saving state")
-    else:
+    if should_save_state(args):
         logger.debug("Saving final state")
         save_state(state, state_file_path)
+    elif args.no_save_state:
+        logger.info("--no-save-state set, not saving state")
+    elif args.dry_run:
+        logger.info("Dry run enabled, not saving state")
+    else:
+        logger.info("Debug mode enabled, not saving state")
 
 
 if __name__ == '__main__':
