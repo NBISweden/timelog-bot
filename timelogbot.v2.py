@@ -259,7 +259,7 @@ def build_report_header(support_project_id, total_hours, hours_ordered):
     Build the "Project X is Y% complete" header shown on a TimeLog page.
     Falls back to a plain hours-spent line when no budget ("Hours ordered") is set,
     since a percentage against an unknown budget would be meaningless.
-    :param support_project_id: WABI ID of the project
+    :param support_project_id: Project ID of the project
     :param total_hours: Total hours logged on the issue
     :param hours_ordered: Budgeted hours for the issue, or None if not set
     :return: HTML string for the report header
@@ -292,13 +292,13 @@ def update_confluence(args, config, issue, name2key, total_hours, time_entries):
     headers = {"Accept": "application/json"}
     auth = requests.auth.HTTPBasicAuth(config["confluence"]["username"], config["confluence"]["api_key"])
 
-    # read WABI ID and hours ordered from Redmine custom fields
-    support_project_id = get_custom_field(issue, 'WABI ID', '')
+    # read Project ID and hours ordered from Redmine custom fields
+    support_project_id = get_custom_field(issue, 'Project ID', '')
     hours_ordered_raw = get_custom_field(issue, 'Hours ordered') or None
     hours_ordered = float(hours_ordered_raw) if hours_ordered_raw else None
 
     if support_project_id and not support_project_id.isascii():
-        logger.warning(f"WABI ID \"{support_project_id}\" contains non-ASCII characters; Confluence space name matching may fail.")
+        logger.warning(f"Project ID \"{support_project_id}\" contains non-ASCII characters; Confluence space name matching may fail.")
 
     # allow overriding the target space when debugging
     if args.debug_space:
@@ -310,10 +310,10 @@ def update_confluence(args, config, issue, name2key, total_hours, time_entries):
     # resolve space name to its Confluence key
     matches = name2key.get(space_name)
     if not matches:
-        logger.error(f"Space \"{space_name}\" not found in Confluence, skipping update for WABI ID \"{support_project_id}\".")
+        logger.error(f"Space \"{space_name}\" not found in Confluence, skipping update for Project ID \"{support_project_id}\".")
         return False
     if len(matches) > 1:
-        logger.error(f"Space \"{space_name}\" is ambiguous ({len(matches)} matches) in Confluence, skipping update for WABI ID \"{support_project_id}\".")
+        logger.error(f"Space \"{space_name}\" is ambiguous ({len(matches)} matches) in Confluence, skipping update for Project ID \"{support_project_id}\".")
         return False
     space_key = matches[0]['key']
 
@@ -458,7 +458,7 @@ def build_notification_body(config, issue, headline, total_hours, hours_ordered,
     :param hours_ordered: Budgeted hours for the issue, or None if not set
     :param issue_age_days: Days passed since the issue's start date
     :param hours_percent: Percentage of ordered hours used, or 0 if hours_ordered is not set
-    :param support_project_id: WABI/Project ID of the issue, or falsy if not set
+    :param support_project_id: Project ID of the issue, or falsy if not set
     :param people: Dict as returned by fetch_issue_people()
     :return: Plain-text e-mail body
     """
@@ -472,7 +472,7 @@ def build_notification_body(config, issue, headline, total_hours, hours_ordered,
         f"Team: {people['team'] or 'N/A'}",
         f"Coordinator: {people['coordinator_name'] or 'N/A'}",
         f"All assignees: {', '.join(people['assignee_names']) if people['assignee_names'] else 'N/A'}",
-        f"WABI/Project ID: {support_project_id or 'N/A'}",
+        f"Project ID: {support_project_id or 'N/A'}",
         "",
         f"Hours spent: {total_hours:.2f}" + (f" of {hours_ordered:.0f} ordered" if hours_ordered else ""),
         f"Percentage of ordered hours used: {hours_percent:.1f}%" if hours_ordered else "Percentage of ordered hours used: N/A (no hours ordered set)",
@@ -629,7 +629,7 @@ def main():
                     current_date = datetime.now().date()
                     issue_age_days = (current_date - start_date).days
 
-                    support_project_id = get_custom_field(issue, 'WABI ID')
+                    support_project_id = get_custom_field(issue, 'Project ID')
                     hours_ordered_raw = get_custom_field(issue, 'Hours ordered')
                     hours_ordered = float(hours_ordered_raw) if hours_ordered_raw else None
                     hours_percent = (total_hours / hours_ordered) * 100 if hours_ordered else 0
