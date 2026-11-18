@@ -26,7 +26,7 @@ project_groups:
     confluence:
       update_pages: true
     checkpoints:
-      days: [15, 180, 365]       # Days passed checkpoints
+      days: [90, 180, 365]       # Days passed checkpoints
       percent_hours: [50, 90, 100]  # Hours logged checkpoints
 
   - group_name: "Another Redmine project"
@@ -37,5 +37,5 @@ project_groups:
     confluence:
       update_pages: false
     checkpoints:
-      days: [15, 180, 365]
+      days: [90, 180, 365]
       percent_hours: [50, 90, 100]
