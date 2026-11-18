@@ -51,7 +51,9 @@ def load_state(file_path):
 def should_save_state(args):
     """
     Decide whether state changes should be persisted to disk, given the current run's flags.
-    Dry runs and debug-scoped runs must not corrupt the real state file unless explicitly forced.
+    Dry runs, debug-scoped runs, and test-email runs must not corrupt the real state file
+    unless explicitly forced, since none of them represent a real notification actually
+    having reached its real recipients.
     :param args: Command line arguments
     :return: True if state should be saved
     """
@@ -59,7 +61,7 @@ def should_save_state(args):
         return False
     if args.force_save_state:
         return True
-    return not (args.dry_run or args.debug_issue_id or args.debug_space)
+    return not (args.dry_run or args.debug_issue_id or args.debug_space or args.test_email)
 
 
 def setup_argparse():
@@ -74,6 +76,7 @@ def setup_argparse():
     parser.add_argument('--debug-space', type=str, help='Limit updating to a specific Confluence space (name, not space key) for debugging')
     parser.add_argument('--disable-email', '-e', action='store_true', help='Emailing disabled')
     parser.add_argument('--dry-run', '-n', action='store_true', help='Run the script without making any changes')
+    parser.add_argument('--test-email', type=str, help='Send all e-mails to this address instead of the real recipients, noting in the body who would have received it for real')
     parser.add_argument('--force-update', '-f', action='store_true', help='Force processing even if hours have not changed')
     save_state_group = parser.add_mutually_exclusive_group()
     save_state_group.add_argument('--force-save-state', '-s', action='store_true', help='Force saving of the state, even if dry-run or debug options are used')
@@ -157,6 +160,100 @@ def fetch_issues(config, project_id):
     return issues
 
 
+def get_custom_field(issue, name, default=None):
+    """
+    Look up a Redmine custom field's raw value by name.
+    :param issue: Redmine issue dictionary
+    :param name: Custom field name, as configured in Redmine
+    :param default: Value to return if the field is absent
+    :return: The custom field's value (type depends on the field's format), or default
+    """
+    return next((cf['value'] for cf in issue['custom_fields'] if cf['name'] == name), default)
+
+
+def fetch_user(config, user_id, user_cache):
+    """
+    Fetch a Redmine user's details, caching the result for the lifetime of the run so that
+    coordinators/assignees shared across many issues only trigger one API call each.
+    :param config: Configuration dictionary
+    :param user_id: Redmine user ID (as a string or int)
+    :param user_cache: Dict used to cache fetched users across calls, keyed by user ID
+    :return: User dictionary
+    """
+    user_id = str(user_id)
+    if user_id in user_cache:
+        return user_cache[user_id]
+
+    headers = {'X-Redmine-API-Key': config["redmine"]["api_key"]}
+    response = requests.get(f'{config["redmine"]["base_url"]}/users/{user_id}.json', headers=headers)
+    if response.status_code != 200:
+        raise Exception(f"Failed to fetch user {user_id}: {response.content}")
+
+    user = response.json()['user']
+    user_cache[user_id] = user
+    return user
+
+
+def user_display_name(user):
+    """
+    Build a display name for a Redmine user dict, as returned by the users API.
+    :param user: User dictionary
+    :return: "Firstname Lastname" string
+    """
+    return user.get('name') or f"{user.get('firstname', '')} {user.get('lastname', '')}".strip()
+
+
+def dedupe_preserve_order(items):
+    """
+    Remove duplicates from a list while keeping the first occurrence's position.
+    :param items: List of hashable items; falsy items are dropped
+    :return: Deduplicated list
+    """
+    seen = set()
+    result = []
+    for item in items:
+        if item and item not in seen:
+            seen.add(item)
+            result.append(item)
+    return result
+
+
+def fetch_issue_people(config, issue, user_cache):
+    """
+    Resolve the people-related fields needed for checkpoint notification e-mails: PI, Team,
+    Coordinator (name + e-mail), and the full list of assignees. "All assignees" is a separate
+    custom field from the standard assigned_to field and the two can overlap, so they are
+    merged and de-duplicated.
+    :param config: Configuration dictionary
+    :param issue: Redmine issue dictionary
+    :param user_cache: Dict used to cache fetched users across calls
+    :return: Dict with keys pi, team, coordinator_name, coordinator_email, assignee_names
+    """
+    coordinator_id = get_custom_field(issue, 'Coordinator')
+    coordinator_name = None
+    coordinator_email = None
+    if coordinator_id:
+        coordinator = fetch_user(config, coordinator_id, user_cache)
+        coordinator_name = user_display_name(coordinator)
+        coordinator_email = coordinator.get('mail')
+
+    assignee_ids = list(get_custom_field(issue, 'All assignees', []) or [])
+    if issue.get('assigned_to'):
+        assignee_ids.append(str(issue['assigned_to']['id']))
+    assignee_names = [
+        user_display_name(fetch_user(config, uid, user_cache))
+        for uid in dedupe_preserve_order(assignee_ids)
+    ]
+
+    return {
+        'pi': get_custom_field(issue, 'Principal Investigator'),
+        'team': get_custom_field(issue, 'Team'),
+        'coordinator_name': coordinator_name,
+        'coordinator_email': coordinator_email,
+        'assignee_names': assignee_names,
+    }
+
+
 def build_report_header(support_project_id, total_hours, hours_ordered):
     """
     Build the "Project X is Y% complete" header shown on a TimeLog page.
@@ -196,8 +293,8 @@ def update_confluence(args, config, issue, name2key, total_hours, time_entries):
     auth = requests.auth.HTTPBasicAuth(config["confluence"]["username"], config["confluence"]["api_key"])
 
     # read WABI ID and hours ordered from Redmine custom fields
-    support_project_id = next((cf['value'] for cf in issue['custom_fields'] if cf['name'] == 'WABI ID'), '')
-    hours_ordered_raw = next((cf['value'] for cf in issue['custom_fields'] if cf['name'] == 'Hours ordered' and cf['value']), None)
+    support_project_id = get_custom_field(issue, 'WABI ID', '')
+    hours_ordered_raw = get_custom_field(issue, 'Hours ordered') or None
     hours_ordered = float(hours_ordered_raw) if hours_ordered_raw else None
 
     if support_project_id and not support_project_id.isascii():
@@ -349,22 +446,37 @@ def issue_url(config, issue):
     return f"{config['redmine']['base_url']}/issues/{issue['id']}"
 
 
-def build_notification_body(config, issue, headline, total_hours, hours_ordered=None):
+def build_notification_body(config, issue, headline, total_hours, hours_ordered, issue_age_days, hours_percent, support_project_id, people):
     """
     Build the plain-text body for a checkpoint notification e-mail.
+    Always reports both checkpoint metrics (calendar time and percent of hours used),
+    regardless of which one triggered this notification, per management's request.
     :param config: Configuration dictionary
     :param issue: Redmine issue dictionary
     :param headline: One-line description of the checkpoint that was crossed
     :param total_hours: Total hours logged on the issue
     :param hours_ordered: Budgeted hours for the issue, or None if not set
+    :param issue_age_days: Days passed since the issue's start date
+    :param hours_percent: Percentage of ordered hours used, or 0 if hours_ordered is not set
+    :param support_project_id: WABI/Project ID of the issue, or falsy if not set
+    :param people: Dict as returned by fetch_issue_people()
     :return: Plain-text e-mail body
     """
     lines = [
         f"Issue #{issue['id']}: {issue['subject']}",
+        f"Link: {issue_url(config, issue)}",
+        "",
         headline,
         "",
-        f"Total hours logged: {total_hours:.2f}" + (f" of {hours_ordered:.0f} ordered" if hours_ordered else ""),
-        f"Link: {issue_url(config, issue)}",
+        f"PI: {people['pi'] or 'N/A'}",
+        f"Team: {people['team'] or 'N/A'}",
+        f"Coordinator: {people['coordinator_name'] or 'N/A'}",
+        f"All assignees: {', '.join(people['assignee_names']) if people['assignee_names'] else 'N/A'}",
+        f"WABI/Project ID: {support_project_id or 'N/A'}",
+        "",
+        f"Hours spent: {total_hours:.2f}" + (f" of {hours_ordered:.0f} ordered" if hours_ordered else ""),
+        f"Percentage of ordered hours used: {hours_percent:.1f}%" if hours_ordered else "Percentage of ordered hours used: N/A (no hours ordered set)",
+        f"Calendar time since start date: {issue_age_days} days",
     ]
     return "\n".join(lines)
 
@@ -372,7 +484,9 @@ def build_notification_body(config, issue, headline, total_hours, hours_ordered=
 def send_email(config, args, to_emails, subject, body):
     """
     Send an email notification via SMTP.
-    Does nothing when --disable-email or --dry-run is set.
+    Does nothing when --disable-email or --dry-run is set. When --test-email is set, the
+    real recipients are noted at the top of the body and the e-mail is sent only to that
+    test address instead, so a real SMTP send can be exercised without spamming real people.
     :param config: Configuration dictionary
     :param args: Command line arguments
     :param to_emails: List of recipient email addresses
@@ -383,8 +497,13 @@ def send_email(config, args, to_emails, subject, body):
         logger.info(f"Emailing is disabled, not sending email \"{subject}\"")
         return
     if args.dry_run:
-        logger.info(f"Dry run: Would have sent email \"{subject}\"")
+        logger.info(f"Dry run: Would have sent email \"{subject}\" to {', '.join(to_emails)}")
         return
+
+    if args.test_email:
+        logger.info(f"--test-email set: redirecting email \"{subject}\" from {', '.join(to_emails)} to {args.test_email}")
+        body = f"[TEST MODE] This e-mail would normally have been sent to: {', '.join(to_emails)}\n\n{body}"
+        to_emails = [args.test_email]
 
     msg = MIMEText(body)
     msg['Subject'] = subject
@@ -467,6 +586,9 @@ def main():
     # fetch all Confluence spaces once up front to avoid per-issue API calls
     name2key = fetch_space_list(config, args)
 
+    # caches Redmine users (coordinators, assignees) across issues for the lifetime of this run
+    user_cache = {}
+
     for group in config['project_groups']:
         logger.debug(f"Processing project group: {group['group_name']} ({', '.join(group['ids'])})")
 
@@ -507,8 +629,14 @@ def main():
                     current_date = datetime.now().date()
                     issue_age_days = (current_date - start_date).days
 
-                    hours_ordered = next((float(cf['value']) for cf in issue['custom_fields'] if cf['name'] == 'Hours ordered' and cf['value']), '')
-                    hours_percent = (total_hours / float(hours_ordered)) * 100 if hours_ordered else 0
+                    support_project_id = get_custom_field(issue, 'WABI ID')
+                    hours_ordered_raw = get_custom_field(issue, 'Hours ordered')
+                    hours_ordered = float(hours_ordered_raw) if hours_ordered_raw else None
+                    hours_percent = (total_hours / hours_ordered) * 100 if hours_ordered else 0
+
+                    # cached per-issue so the day- and percent-checkpoint blocks below don't both
+                    # hit the Redmine users API when both checkpoints trigger for the same issue
+                    people = None
 
                     # first run for this issue: record baseline state and skip all notifications
                     # to avoid a flood of alerts for issues that have already been running for a while
@@ -527,7 +655,6 @@ def main():
                     if state[issue['id']]['total_hours'] != total_hours or args.force_update:
 
                         # update the Confluence page if this project group has that enabled
-                        support_project_id = next((cf['value'] for cf in issue['custom_fields'] if cf['name'] == 'WABI ID'), None)
                         if support_project_id and update_pages:
                             logger.debug(f"Updating Confluence page for project id {support_project_id}")
                             update_confluence(args, config, issue, name2key, total_hours, time_entries)
@@ -541,13 +668,16 @@ def main():
                         if newly_passed:
                             checkpoint_days = max(newly_passed)
                             logger.warning(f"Issue {issue['id']} has passed {checkpoint_days} days since start date ({issue_age_days} days)")
+                            if people is None:
+                                people = fetch_issue_people(config, issue, user_cache)
+                            to_emails = dedupe_preserve_order(([people['coordinator_email']] if people['coordinator_email'] else []) + managers)
                             send_email(
-                                config, args, managers,
+                                config, args, to_emails,
                                 f"TimeLogBot: {issue_age_days} days issue age for #{issue['id']}: \"{issue['subject']}\"",
                                 build_notification_body(
                                     config, issue,
                                     f"has been open for {issue_age_days} days (checkpoint: {checkpoint_days} days).",
-                                    total_hours, hours_ordered if hours_ordered else None
+                                    total_hours, hours_ordered, issue_age_days, hours_percent, support_project_id, people
                                 )
                             )
                             state[issue['id']]['warnings_sent']['checkpoint_passed_days'].extend(newly_passed)
@@ -565,13 +695,16 @@ def main():
                         if newly_passed:
                             checkpoint_percent = max(newly_passed)
                             logger.warning(f"Issue {issue['id']} has used {hours_percent:.1f}% of ordered hours (checkpoint: {checkpoint_percent}%)")
+                            if people is None:
+                                people = fetch_issue_people(config, issue, user_cache)
+                            to_emails = dedupe_preserve_order(([people['coordinator_email']] if people['coordinator_email'] else []) + managers)
                             send_email(
-                                config, args, managers,
+                                config, args, to_emails,
                                 f"TimeLogBot: {hours_percent:.1f}% of ordered hours used by #{issue['id']}: \"{issue['subject']}\"",
                                 build_notification_body(
                                     config, issue,
                                     f"has used {hours_percent:.1f}% of ordered hours (checkpoint: {checkpoint_percent}%).",
-                                    total_hours, hours_ordered
+                                    total_hours, hours_ordered, issue_age_days, hours_percent, support_project_id, people
                                 )
                             )
                             state[issue['id']]['warnings_sent']['checkpoint_passed_percent'].extend(newly_passed)
